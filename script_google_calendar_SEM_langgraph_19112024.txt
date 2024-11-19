@@ -1,0 +1,538 @@
+# Este script integra o Google Calendar e a OpenAI para gerenciar eventos de calendário usando linguagem natural. 
+# Ele permite criar, listar, atualizar e deletar eventos, além de interpretar consultas em linguagem natural e interagir com o Google Calendar.
+
+from datetime import datetime, timedelta
+from googleapiclient.discovery import build
+from google.oauth2 import service_account
+import openai
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+# Variables
+GOOGLE_CREDENTIALS_FILE = "service_account_credentials.json"
+CALENDAR_ID = os.getenv('CALENDAR_ID')
+SCOPES = ['https://www.googleapis.com/auth/calendar.readonly', 'https://www.googleapis.com/auth/calendar']
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+OPENAI_MODEL_NAME = os.getenv('OPENAI_MODEL_NAME')
+
+# Initialize OpenAI
+openai.api_key = OPENAI_API_KEY
+
+
+# Function to connect to Google Calendar API
+def connect_to_google_calendar():
+    credentials = service_account.Credentials.from_service_account_file(
+        GOOGLE_CREDENTIALS_FILE,
+        scopes=SCOPES
+    )
+    service = build("calendar", "v3", credentials=credentials)
+    return service
+
+
+# Function to parse dates in human-readable formats (ex.: 19/11/2024 ou 19/11/2024 15:00)
+def parse_date(date_str):
+    """
+    Função para interpretar datas tanto no formato DD/MM/YYYY quanto DD/MM/YYYY HH:MM
+    """
+    try:
+        if ' ' in date_str:  # Se tem hora
+            return datetime.strptime(date_str.strip(), "%d/%m/%Y %H:%M")
+        else:  # Se é só data
+            return datetime.strptime(date_str.strip(), "%d/%m/%Y")
+    except ValueError as e:
+        print(f"Erro ao interpretar data: {str(e)}")  # Debug
+        return None
+
+# Function to parse duration inputs (ex.: "30", "1h", "1h30", "90m")
+def parse_duration_input(duration_str):
+    """
+    Converte entrada de duração em minutos
+    Aceita formatos como: "30", "1h", "1h30", "1:30", "90m"
+    """
+    try:
+        duration_str = duration_str.lower().strip()
+        if 'h' in duration_str:
+            parts = duration_str.split('h')
+            hours = int(parts[0])
+            minutes = int(parts[1]) if parts[1] else 0
+            return hours * 60 + minutes
+        elif ':' in duration_str:
+            hours, minutes = map(int, duration_str.split(':'))
+            return hours * 60 + minutes
+        elif 'm' in duration_str:
+            return int(duration_str.rstrip('m'))
+        else:
+            return int(duration_str)
+    except:
+        return None
+
+# Function to process event description
+def process_description(description):
+    """
+    Processa a descrição de um evento para extrair como lista de strings formatadas.
+    """
+    if not description or description == "Sem descrição":
+        return ["Sem descrição"]
+    
+    # Dividir a descrição por linhas e limpar
+    lines = description.split("\n")
+    processed_lines = [line.strip() for line in lines if line.strip()]
+    
+    return processed_lines
+
+
+# Function to list Google Calendar events by a specific period
+def list_events_by_period(service, start_date_str, end_date_str, max_results=10):
+    """
+    Lista eventos do Google Calendar para um período específico.
+    Aceita datas no formato DD/MM/YYYY ou DD/MM/YYYY HH:MM
+    """
+    try:
+        # Verifica se a data inclui hora
+        if ' ' in start_date_str:
+            start_date = datetime.strptime(start_date_str, "%d/%m/%Y %H:%M")
+        else:
+            start_date = datetime.strptime(start_date_str, "%d/%m/%Y")
+            start_date = start_date.replace(hour=0, minute=0)
+
+        if ' ' in end_date_str:
+            end_date = datetime.strptime(end_date_str, "%d/%m/%Y %H:%M")
+        else:
+            end_date = datetime.strptime(end_date_str, "%d/%m/%Y")
+            end_date = end_date.replace(hour=23, minute=59)
+
+        # Converter para RFC3339 timestamp com timezone
+        start = start_date.isoformat() + '-03:00'
+        end = end_date.isoformat() + '-03:00'
+
+        print(f"Buscando eventos entre {start} e {end}")
+
+        events_result = service.events().list(
+            calendarId=CALENDAR_ID,
+            timeMin=start,
+            timeMax=end,
+            maxResults=max_results,
+            singleEvents=True,
+            orderBy="startTime"
+        ).execute()
+
+        events = events_result.get("items", [])
+        
+        if not events:
+            return []
+        
+        formatted_events = []
+        for event in events:
+            # Extrair informações do evento com tratamento para campos opcionais
+            summary = event.get('summary', 'Sem título')
+            status = event.get('status', 'N/A')
+            description = event.get('description', 'Sem descrição')
+            
+            # Processar a descrição em lista
+            description_list = process_description(description)
+            
+            # Tratar tanto eventos de dia inteiro quanto eventos com hora
+            start = event['start'].get('dateTime', event['start'].get('date'))
+            end = event['end'].get('dateTime', event['end'].get('date'))
+            
+            # Converter string ISO para datetime para formatação
+            if 'T' in start:  # eventos com hora
+                start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
+                end_dt = datetime.fromisoformat(end.replace('Z', '+00:00'))
+                event_str = [
+                    f"📅 {summary}",
+                    f"   Início: {start_dt.strftime('%d/%m/%Y %H:%M')}",
+                    f"   Fim: {end_dt.strftime('%d/%m/%Y %H:%M')}",
+                    f"   Status: {status}",
+                    "   Descrição:"
+                ]
+                # Adicionar cada linha da descrição
+                for desc_line in description_list:
+                    event_str.append(f"      - {desc_line}")
+            else:  # eventos de dia inteiro
+                start_dt = datetime.fromisoformat(start)
+                end_dt = datetime.fromisoformat(end)
+                event_str = [
+                    f"📅 {summary}",
+                    f"   Data: {start_dt.strftime('%d/%m/%Y')} (Dia inteiro)",
+                    f"   Status: {status}",
+                    "   Descrição:"
+                ]
+                # Adicionar cada linha da descrição
+                for desc_line in description_list:
+                    event_str.append(f"      - {desc_line}")
+            
+            formatted_events.append("\n".join(event_str))
+        
+        return formatted_events
+
+    except Exception as e:
+        print(f"Erro ao listar eventos: {str(e)}")
+        return []
+
+
+# Function to create events in Google Calendar
+def create_event(service, summary, start_date_str, end_date_str, description=None):
+    """
+    Criar evento no Google Calendar com interação do usuário
+    """
+    try:
+        # Converter string inicial para datetime
+        start_datetime = parse_date(start_date_str)
+        if not start_datetime:
+            raise ValueError("Data inicial inválida")
+
+        # Perguntar o título do evento
+        event_title = input("\nQual o título do evento? ").strip()
+        if not event_title:
+            event_title = "Novo Evento"
+
+        # Interagir com o usuário para obter a duração
+        while True:
+            duration_input = input("\nQuanto tempo de duração? (ex: 30m, 1h, 1h30, 1:30): ")
+            duration_minutes = parse_duration_input(duration_input)
+            
+            if duration_minutes and duration_minutes > 0:
+                break
+            print("❌ Duração inválida. Por favor, tente novamente.")
+
+        # Calcular data/hora final baseado na duração
+        end_datetime = start_datetime + timedelta(minutes=duration_minutes)
+
+        # Perguntar sobre descrição - Com lógica corrigida
+        description = None
+        while True:
+            add_description = input("\nDeseja adicionar uma descrição? (s/n): ").lower().strip()
+            if add_description in ['s', 'sim', 'y', 'yes', 'ok', 'quero']:
+                description = input("Digite a descrição do evento: ").strip()
+                break
+            elif add_description in ['n', 'nao', 'não', 'no', 'nao quero', 'não qyero']:
+                break
+            else:
+                print("❌ Por favor, responda 's' para sim ou 'n' para não.")
+
+        # Criar o corpo do evento
+        event = {
+            "summary": event_title,
+            "start": {
+                "dateTime": start_datetime.isoformat(),
+                "timeZone": "America/Sao_Paulo"
+            },
+            "end": {
+                "dateTime": end_datetime.isoformat(),
+                "timeZone": "America/Sao_Paulo"
+            }
+        }
+
+        # Adicionar descrição somente se foi fornecida
+        if description:
+            event["description"] = description
+
+        # Mostrar resumo antes de criar
+        print("\nResumo do evento:")
+        print(f"📅 Título: {event['summary']}")
+        print(f"   Início: {start_datetime.strftime('%d/%m/%Y %H:%M')}")
+        print(f"   Fim: {end_datetime.strftime('%d/%m/%Y %H:%M')}")
+        print(f"   Duração: {duration_minutes} minutos")
+        if description:
+            print(f"   Descrição: {description}")
+
+        while True:
+            confirm = input("\nConfirma a criação do evento? (s/n): ").lower().strip()
+            if confirm in ['s', 'sim', 'y', 'yes', 'ok', 'quero']:
+                created_event = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
+                return created_event, None
+            elif confirm in ['n', 'nao', 'não', 'no', 'nao quero', 'não qyero']:
+                return None, "Criação do evento cancelada pelo usuário."
+            else:
+                print("❌ Por favor, responda 's' para sim ou 'n' para não.")
+
+    except Exception as e:
+        print(f"Erro ao criar evento: {str(e)}")  # Debug
+        return None, str(e)
+    
+
+# Function to delete events
+def delete_event(service, event_id):
+    service.events().delete(calendarId=CALENDAR_ID, eventId=event_id).execute()
+
+
+# Function to update events
+def update_event(service, event_id, new_summary, new_start_str, new_end_str, new_description=None):
+    new_start_datetime = parse_date(new_start_str).isoformat()
+    new_end_datetime = parse_date(new_end_str).isoformat()
+    event = service.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
+    event['summary'] = new_summary
+    event['start']['dateTime'] = new_start_datetime
+    event['end']['dateTime'] = new_end_datetime
+    if new_description:
+        event['description'] = new_description
+    updated_event = service.events().update(calendarId=CALENDAR_ID, eventId=event_id, body=event).execute()
+    return updated_event
+
+
+# Function to handle natural language queries
+def handle_natural_language_query(service, query):
+    now = datetime.now()
+    current_date = now.strftime("%d/%m/%Y")
+    current_time = now.strftime("%H:%M")
+    current_weekday = now.strftime("%A")
+
+    prompt = f"""Você é um assistente especializado em gerenciar agenda do Google Calendar. Hoje é {current_date}, {current_weekday}, {current_time}.
+Sua função é interpretar consultas em linguagem natural sobre agenda e calendário.
+
+Retorne apenas um JSON com a seguinte estrutura, identificando a intenção principal do usuário:
+
+Converta SEMPRE referências como 'hoje', 'amanhã', 'próxima semana' para datas reais baseadas em {current_date}.
+
+Para VISUALIZAR agenda/eventos/compromissos:
+{{"action": "listar", "parameters": {{"start_date": "DD/MM/YYYY", "end_date": "DD/MM/YYYY"}}}}
+
+Para VERIFICAR disponibilidade (incluindo consultas compostas):
+{{"action": "verificar", 
+  "parameters": {{
+    "date": "DD/MM/YYYY",
+    "time": "HH:MM",
+    "next_action": "criar|deletar|atualizar",  # Opcional, usado em consultas compostas
+    "original_date": "DD/MM/YYYY",  # Opcional, usado quando next_action é "atualizar"
+    "original_time": "HH:MM"  # Opcional, usado quando next_action é "atualizar"
+  }}
+}}
+
+Para CRIAR compromissos:
+{{"action": "criar", "parameters": {{"summary": "título", "start_date": "DD/MM/YYYY HH:MM", "end_date": "DD/MM/YYYY HH:MM", "description": "descrição"}}}}
+
+Para CANCELAR/DELETAR compromissos (primeiro lista o evento para obter o ID):
+{{"action": "listar_para_deletar", "parameters": {{"date": "DD/MM/YYYY", "time": "HH:MM"}}}}
+
+Para ATUALIZAR/REAGENDAR compromissos (consultas como "atualize", "remarque", "mude", "altere"):
+{{"action": "listar_para_atualizar", "parameters": {{"old_date": "DD/MM/YYYY", "old_time": "HH:MM", "new_date": "DD/MM/YYYY", "new_time": "HH:MM"}}}}
+
+Para consultas compostas (verificar e executar outra ação):
+{{"action": "verificar", "parameters": {{"date": "DD/MM/YYYY", "time": "HH:MM", "next_action": "criar|deletar|atualizar"}}}}
+
+IMPORTANTE: 
+- Foque em identificar a intenção básica (listar, verificar, criar, listar_para_deletar) e as datas relevantes
+- Para cancelamentos/deleções, use a ação 'listar_para_deletar' para primeiro identificar o evento específico
+- Para consultas sobre disponibilidade ou verificação de agenda, use SEMPRE a ação "verificar"
+- Use "listar_para_deletar" APENAS quando o usuário explicitamente pedir para cancelar/deletar
+- Use "criar" apenas quando houver pedido explícito de criação
+- Para reagendar/alterar/mudar, use a ação 'listar_para_atualizar' para primeiro identificar o evento específico
+- Para consultas compostas (ex: "verificar e criar" ou "verificar e cancelar"), use "verificar" com next_action apropriada"""
+
+    
+    try:
+        response = openai.chat.completions.create(
+            model=OPENAI_MODEL_NAME,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": query}
+            ],
+            temperature=0.2,
+            response_format={ "type": "json_object" }
+        )
+        
+        result = response.choices[0].message.content.strip()
+        print(f"LLM Respondeu: {result}")
+        
+        parsed_response = eval(result)
+        action = parsed_response.get('action')
+        params = parsed_response.get('parameters', {})
+        
+        if action == 'listar_para_deletar':
+            # Primeiro, buscar o evento no horário especificado
+            start_datetime = f"{params['date']} {params['time']}"
+            start_date = datetime.strptime(start_datetime, "%d/%m/%Y %H:%M")
+            end_date = start_date.replace(hour=start_date.hour + 1)
+            
+            # Buscar eventos no período
+            events_result = service.events().list(
+                calendarId=CALENDAR_ID,
+                timeMin=start_date.isoformat() + '-03:00',
+                timeMax=end_date.isoformat() + '-03:00',
+                maxResults=1,
+                singleEvents=True,
+                orderBy="startTime"
+            ).execute()
+            
+            events = events_result.get("items", [])
+            
+            if not events:
+                return f"Não encontrei nenhum evento agendado para {params['date']} às {params['time']}"
+            
+            event = events[0]  # Pegar o primeiro evento encontrado
+            event_id = event['id']
+            event_summary = event.get('summary', 'Sem título')
+            
+            # Confirmar com o usuário
+            print(f"\nEncontrei este evento para cancelar:")
+            print(f"Título: {event_summary}")
+            print(f"Data: {params['date']}")
+            print(f"Hora: {params['time']}")
+            
+            confirmation = input("\nDeseja realmente cancelar este evento? (s/n): ").lower().strip()
+            
+            # Aceitar diferentes formas de confirmação
+            if confirmation in ['s', 'sim', 'yes', 'y']:
+                try:
+                    delete_event(service, event_id)
+                    print(f"Deletando evento com ID: {event_id}")  # Debug
+                    return f"✅ Evento '{event_summary}' foi cancelado com sucesso!"
+                except Exception as e:
+                    print(f"Erro ao deletar evento: {str(e)}")  # Debug
+                    return f"❌ Erro ao tentar cancelar o evento: {str(e)}"
+            else:
+                return "Operação de cancelamento cancelada pelo usuário."
+
+        elif action == 'listar':
+            events = list_events_by_period(service, params['start_date'], params['end_date'])
+            if not events:
+                return f"📅 Não há eventos agendados para este período.\nPeríodo consultado: {params['start_date']} a {params['end_date']}"
+            return "📅 Eventos encontrados:\n\n" + "\n\n".join(events)
+            
+        elif action == 'verificar':
+            start_datetime = f"{params['date']} {params['time']}"
+            start_date = datetime.strptime(start_datetime, "%d/%m/%Y %H:%M")
+            end_date = start_date.replace(hour=start_date.hour + 1)
+            
+            events = list_events_by_period(
+                service,
+                start_date.strftime("%d/%m/%Y %H:%M"),
+                end_date.strftime("%d/%m/%Y %H:%M")
+            )
+
+            # Verificar se existe next_action
+            next_action = params.get('next_action')
+
+            if events:
+                if next_action == 'deletar':
+                    print("Este horário está ocupado. Iniciando processo de cancelamento...")
+                    return handle_natural_language_query(service, f"cancele o evento de {start_datetime}")
+                return "Este horário está ocupado com os seguintes eventos:\n" + "\n".join(events)
+            else:
+                if next_action == 'criar':
+                    print("Este horário está livre. Iniciando processo de criação...")
+                    return handle_natural_language_query(service, f"crie uma reunião para {start_datetime}")
+                elif next_action == 'atualizar' and 'original_time' in params and 'original_date' in params:
+                    print(f"Este horário está livre. Iniciando processo de atualização...")
+                    return handle_natural_language_query(
+                        service, 
+                        f"altere o evento de {params['original_date']} {params['original_time']} para {params['date']} {params['time']}"
+                    )
+                return "Este horário está livre para agendamentos."
+            
+        elif action == 'criar':
+            try:
+                event, error = create_event(
+                    service,
+                    params['summary'],
+                    params['start_date'],
+                    params['end_date'],
+                    params.get('description')
+                )
+                
+                if error:
+                    return f"❌ {error}"
+                    
+                if event:
+                    return f"✅ Compromisso agendado com sucesso!"
+                else:
+                    return "Operação cancelada."
+                    
+            except Exception as e:
+                return f"❌ Não foi possível criar o evento: {str(e)}"
+
+        # Novo bloco para atualização de eventos
+        if action == 'listar_para_atualizar':
+            # Primeiro, buscar o evento existente
+            old_datetime = f"{params['old_date']} {params['old_time']}"
+            start_date = datetime.strptime(old_datetime, "%d/%m/%Y %H:%M")
+            end_date = start_date.replace(hour=start_date.hour + 1)
+            
+            events_result = service.events().list(
+                calendarId=CALENDAR_ID,
+                timeMin=start_date.isoformat() + '-03:00',
+                timeMax=end_date.isoformat() + '-03:00',
+                maxResults=1,
+                singleEvents=True,
+                orderBy="startTime"
+            ).execute()
+            
+            events = events_result.get("items", [])
+            
+            if not events:
+                return f"Não encontrei nenhum evento em {params['old_date']} às {params['old_time']}"
+            
+            event = events[0]
+            event_id = event['id']
+            old_summary = event.get('summary', 'Sem título')
+            old_description = event.get('description', 'Sem descrição')
+            
+            print(f"\nEncontrei este evento para atualizar:")
+            print(f"Título atual: {old_summary}")
+            print(f"Data atual: {params['old_date']}")
+            print(f"Hora atual: {params['old_time']}")
+            
+            # Coletar novos dados
+            new_summary = input("\nNovo título do evento (ou Enter para manter o atual): ").strip()
+            if not new_summary:
+                new_summary = old_summary
+
+            while True:
+                duration_input = input("\nNova duração? (ex: 30m, 1h, 1h30, 1:30): ")
+                duration_minutes = parse_duration_input(duration_input)
+                
+                if duration_minutes and duration_minutes > 0:
+                    break
+                print("❌ Duração inválida. Por favor, tente novamente.")
+
+            # Calcular novo horário final
+            new_start = datetime.strptime(f"{params['new_date']} {params['new_time']}", "%d/%m/%Y %H:%M")
+            new_end = new_start + timedelta(minutes=duration_minutes)
+
+            # Perguntar sobre nova descrição
+            update_description = input("\nDeseja atualizar a descrição? (s/n): ").lower().strip()
+            new_description = old_description
+            if update_description in ['s', 'sim', 'y', 'yes', 'ok', 'quero']:
+                new_description = input("Nova descrição do evento: ").strip()
+
+            # Mostrar resumo das alterações
+            print("\nResumo das alterações:")
+            print(f"📅 De: {old_summary} -> Para: {new_summary}")
+            print(f"   De: {params['old_date']} {params['old_time']} -> Para: {params['new_date']} {params['new_time']}")
+            print(f"   Nova duração: {duration_minutes} minutos")
+            if new_description != old_description:
+                print(f"   Nova descrição: {new_description}")
+
+            # Confirmar atualização
+            confirm = input("\nConfirma a atualização do evento? (s/n): ").lower().strip()
+            if confirm in ['s', 'sim', 'y', 'yes', 'ok', 'quero']:
+                try:
+                    event = update_event(
+                        service,
+                        event_id,
+                        new_summary,
+                        f"{params['new_date']} {params['new_time']}",
+                        new_end.strftime("%d/%m/%Y %H:%M"),
+                        new_description
+                    )
+                    return "✅ Evento atualizado com sucesso!"
+                except Exception as e:
+                    return f"❌ Erro ao atualizar evento: {str(e)}"
+            else:
+                return "Operação de atualização cancelada pelo usuário."
+
+    except Exception as e:
+        print(f"Erro: {str(e)}")
+        return "Desculpe, não consegui processar sua solicitação. Pode tentar explicar de outra forma?"
+
+
+# Main block for script execution
+if __name__ == "__main__":
+    calendar_service = connect_to_google_calendar()
+
+    # Exemplo de interação com linguagem natural
+    user_query = input("Como posso ajudar? ")
+    result = handle_natural_language_query(calendar_service, user_query)
+    print(result)

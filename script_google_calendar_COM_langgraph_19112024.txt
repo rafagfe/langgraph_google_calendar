@@ -1,0 +1,550 @@
+# Este script implementa um fluxo de trabalho automatizado para gerenciar eventos no Google Calendar utilizando consultas em linguagem natural.
+# Ele usa as bibliotecas `langgraph`, `langchain`, e a API da OpenAI para interpretar a intenção do usuário e executar ações como listar, criar, atualizar e deletar eventos.
+# O script também gera um diagrama do fluxo de estados e suporta respostas formatadas e verificações de disponibilidade no calendário.
+
+
+from typing import TypedDict, Dict, Any
+from langgraph.graph import StateGraph, END
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+import openai
+from datetime import datetime, timedelta
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+import os
+from langchain_core.runnables.graph import MermaidDrawMethod
+
+from dotenv import load_dotenv
+load_dotenv()
+
+# Variables
+GOOGLE_CREDENTIALS_FILE = "service_account_credentials.json"
+CALENDAR_ID = os.getenv('CALENDAR_ID')
+SCOPES = ['https://www.googleapis.com/auth/calendar.readonly', 'https://www.googleapis.com/auth/calendar']
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+OPENAI_MODEL_NAME = os.getenv('OPENAI_MODEL_NAME')
+
+# Initialize OpenAI
+openai.api_key = OPENAI_API_KEY
+
+# Define state workflow
+class State(TypedDict):
+    query: str
+    service: Any
+    action: str
+    parameters: Dict
+    events: list
+    formatted_events: list
+    event_id: str
+    status: str
+    error: str
+    next_action: str
+    confirmation: bool
+    start_date: str
+    end_date: str
+    event_data: dict
+
+
+# Connect google calendar
+def setup_calendar(state: State) -> State:
+    """Estabelece conexão com Google Calendar"""
+    try:
+        credentials = service_account.Credentials.from_service_account_file(
+            GOOGLE_CREDENTIALS_FILE,
+            scopes=SCOPES
+        )
+        service = build("calendar", "v3", credentials=credentials)
+        return state | {"service": service, "status": "connected"}
+    except Exception as e:
+        return state | {"error": f"Erro de conexão: {str(e)}", "status": "error"}
+
+# Function to interpret many format data
+def parse_date(date_str):
+    """Função para interpretar datas tanto no formato DD/MM/YYYY quanto DD/MM/YYYY HH:MM"""
+    try:
+        if ' ' in date_str:  # Se tem hora
+            return datetime.strptime(date_str.strip(), "%d/%m/%Y %H:%M")
+        else:  # Se é só data
+            return datetime.strptime(date_str.strip(), "%d/%m/%Y")
+    except ValueError as e:
+        print(f"Erro ao interpretar data: {str(e)}")  # Debug
+        return None
+
+# Function to convert duration minutes
+def parse_duration_input(duration_str):
+    """Converte entrada de duração em minutos"""
+    try:
+        duration_str = duration_str.lower().strip()
+        if 'h' in duration_str:
+            parts = duration_str.split('h')
+            hours = int(parts[0])
+            minutes = int(parts[1]) if parts[1] else 0
+            return hours * 60 + minutes
+        elif ':' in duration_str:
+            hours, minutes = map(int, duration_str.split(':'))
+            return hours * 60 + minutes
+        elif 'm' in duration_str:
+            return int(duration_str.rstrip('m'))
+        else:
+            return int(duration_str)
+    except:
+        return None
+
+# Function to describe a event to extract string list formats
+def process_description(description):
+    """Processa a descrição de um evento para extrair como lista de strings formatadas."""
+    if not description or description == "Sem descrição":
+        return ["Sem descrição"]
+    
+    lines = description.split("\n")
+    processed_lines = [line.strip() for line in lines if line.strip()]
+    
+    return processed_lines
+
+# Function to interpret user search
+def interpret_query(state: State) -> State:
+    """Interpreta a consulta do usuário"""
+    now = datetime.now()
+    current_date = now.strftime("%d/%m/%Y")
+    current_time = now.strftime("%H:%M")
+    current_weekday = now.strftime("%A")
+
+    prompt = f"""Você é um assistente especializado em gerenciar agenda do Google Calendar. Hoje é {current_date}, {current_weekday}, {current_time}.
+Sua função é interpretar consultas em linguagem natural sobre agenda e calendário.
+
+Retorne apenas um JSON com a seguinte estrutura, identificando a intenção principal do usuário:
+
+Converta SEMPRE referências como 'hoje', 'amanhã', 'próxima semana' para datas reais baseadas em {current_date}.
+
+Para VISUALIZAR agenda/eventos/compromissos:
+{{"action": "listar", "parameters": {{"start_date": "DD/MM/YYYY", "end_date": "DD/MM/YYYY"}}}}
+
+Para VERIFICAR disponibilidade (incluindo consultas compostas):
+{{"action": "verificar", 
+  "parameters": {{
+    "date": "DD/MM/YYYY",
+    "time": "HH:MM",
+    "next_action": "criar|deletar|atualizar",  # Opcional, usado em consultas compostas
+    "original_date": "DD/MM/YYYY",  # Opcional, usado quando next_action é "atualizar"
+    "original_time": "HH:MM"  # Opcional, usado quando next_action é "atualizar"
+  }}
+}}
+
+Para CRIAR compromissos:
+{{"action": "criar", "parameters": {{"summary": "título", "start_date": "DD/MM/YYYY HH:MM", "end_date": "DD/MM/YYYY HH:MM", "description": "descrição"}}}}
+
+Para CANCELAR/DELETAR compromissos (primeiro lista o evento para obter o ID):
+{{"action": "listar_para_deletar", "parameters": {{"date": "DD/MM/YYYY", "time": "HH:MM"}}}}
+
+Para ATUALIZAR/REAGENDAR compromissos (consultas como "atualize", "remarque", "mude", "altere"):
+{{"action": "listar_para_atualizar", "parameters": {{"old_date": "DD/MM/YYYY", "old_time": "HH:MM", "new_date": "DD/MM/YYYY", "new_time": "HH:MM"}}}}
+
+Para consultas compostas (verificar e executar outra ação):
+{{"action": "verificar", "parameters": {{"date": "DD/MM/YYYY", "time": "HH:MM", "next_action": "criar|deletar|atualizar"}}}}
+
+IMPORTANTE: 
+- Foque em identificar a intenção básica (listar, verificar, criar, listar_para_deletar) e as datas relevantes
+- Para cancelamentos/deleções, use a ação 'listar_para_deletar' para primeiro identificar o evento específico
+- Para consultas sobre disponibilidade ou verificação de agenda, use SEMPRE a ação "verificar"
+- Use "listar_para_deletar" APENAS quando o usuário explicitamente pedir para cancelar/deletar
+- Use "criar" apenas quando houver pedido explícito de criação
+- Para reagendar/alterar/mudar, use a ação 'listar_para_atualizar' para primeiro identificar o evento específico
+- Para consultas compostas (ex: "verificar e criar" ou "verificar e cancelar"), use "verificar" com next_action apropriada
+
+Consulta do usuário: {state['query']}"""
+
+    try:
+        response = openai.chat.completions.create(
+            model=OPENAI_MODEL_NAME,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": state['query']}
+            ],
+            temperature=0.2,
+            response_format={ "type": "json_object" }
+        )
+        
+        result = eval(response.choices[0].message.content.strip())
+        print(f"LLM Respondeu: {result}")
+        
+        return state | {
+            "action": result["action"],
+            "parameters": result["parameters"],
+            "status": "interpreted"
+        }
+    except Exception as e:
+        return state | {"error": f"Erro de interpretação: {str(e)}", "status": "error"}
+
+# Function to list events google calendar
+def list_events(state: State) -> State:
+    """Lista eventos do período especificado"""
+    if state["action"] not in ["listar", "verificar"]:
+        return state
+    
+    try:
+        params = state["parameters"]
+        
+        # Verificar se a data inclui hora
+        if state["action"] == "verificar":
+            start_datetime = f"{params['date']} {params['time']}"
+            start_date = datetime.strptime(start_datetime, "%d/%m/%Y %H:%M")
+            end_date = start_date.replace(hour=start_date.hour + 1)
+        else:
+            # Para listagem de período
+            start_date = datetime.strptime(params['start_date'], "%d/%m/%Y")
+            end_date = datetime.strptime(params['end_date'], "%d/%m/%Y")
+            start_date = start_date.replace(hour=0, minute=0)
+            end_date = end_date.replace(hour=23, minute=59)
+
+        # Converter para RFC3339 timestamp com timezone (como estava no código original)
+        start = start_date.isoformat() + '-03:00'
+        end = end_date.isoformat() + '-03:00'
+
+        print(f"Buscando eventos entre {start} e {end}")
+
+        events_result = state["service"].events().list(
+            calendarId=CALENDAR_ID,
+            timeMin=start,
+            timeMax=end,
+            maxResults=10,
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+
+        events = events_result.get('items', [])
+        
+        if not events:
+            return state | {
+                "results": [],
+                "formatted_results": ["📅 Não há eventos agendados para este período."],
+                "status": "listed"
+            }
+
+        # Formatar eventos como estava no código original
+        formatted_events = []
+        for event in events:
+            summary = event.get('summary', 'Sem título')
+            status = event.get('status', 'N/A')
+            description = event.get('description', 'Sem descrição')
+            
+            # Processar a descrição em lista
+            description_list = description.split("\n") if description != "Sem descrição" else ["Sem descrição"]
+            description_list = [line.strip() for line in description_list if line.strip()]
+            
+            start = event['start'].get('dateTime', event['start'].get('date'))
+            end = event['end'].get('dateTime', event['end'].get('date'))
+            
+            if 'T' in start:  # eventos com hora
+                start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
+                end_dt = datetime.fromisoformat(end.replace('Z', '+00:00'))
+                event_str = [
+                    f"📅 {summary}",
+                    f"   Início: {start_dt.strftime('%d/%m/%Y %H:%M')}",
+                    f"   Fim: {end_dt.strftime('%d/%m/%Y %H:%M')}",
+                    f"   Status: {status}",
+                    "   Descrição:"
+                ]
+            else:  # eventos de dia inteiro
+                start_dt = datetime.fromisoformat(start)
+                end_dt = datetime.fromisoformat(end)
+                event_str = [
+                    f"📅 {summary}",
+                    f"   Data: {start_dt.strftime('%d/%m/%Y')} (Dia inteiro)",
+                    f"   Status: {status}",
+                    "   Descrição:"
+                ]
+
+            # Adicionar cada linha da descrição
+            for desc_line in description_list:
+                event_str.append(f"      - {desc_line}")
+            
+            formatted_events.append("\n".join(event_str))
+        
+        return state | {
+            "results": events,
+            "formatted_results": formatted_events,
+            "status": "listed"
+        }
+        
+    except Exception as e:
+        print(f"Erro detalhado: {str(e)}")  # Debug
+        return state | {"error": f"Erro ao listar eventos: {str(e)}", "status": "error"}
+
+# Function to create events google calendar
+def create_event(state: State) -> State:
+    """Cria novo evento"""
+    if state["action"] != "criar":
+        return state
+        
+    try:
+        params = state["parameters"]
+        event = {
+            "summary": params["summary"],
+            "start": {"dateTime": params["start_date"], "timeZone": "America/Sao_Paulo"},
+            "end": {"dateTime": params["end_date"], "timeZone": "America/Sao_Paulo"}
+        }
+        
+        created_event = state["service"].events().insert(
+            calendarId=CALENDAR_ID,
+            body=event
+        ).execute()
+        
+        return state | {
+            "results": [created_event],
+            "status": "created"
+        }
+    except Exception as e:
+        return state | {"error": f"Erro ao criar evento: {str(e)}", "status": "error"}
+
+# Function to delete events google calendar
+def delete_event(state: State) -> State:
+    """Deleta evento existente"""
+    if state["action"] != "listar_para_deletar" or not state.get("event_id"):
+        return state
+        
+    try:
+        state["service"].events().delete(
+            calendarId=CALENDAR_ID,
+            eventId=state["event_id"]
+        ).execute()
+        
+        return state | {"status": "deleted"}
+    except Exception as e:
+        return state | {"error": f"Erro ao deletar evento: {str(e)}", "status": "error"}
+
+# Function to update events google calendar
+def update_event(state: State) -> State:
+    """Atualiza evento existente"""
+    if state["action"] != "listar_para_atualizar" or not state.get("event_id"):
+        return state
+        
+    try:
+        params = state["parameters"]
+        event = state["service"].events().get(
+            calendarId=CALENDAR_ID,
+            eventId=state["event_id"]
+        ).execute()
+        
+        event["start"]["dateTime"] = params["new_date"]
+        event["end"]["dateTime"] = params["new_end_date"]
+        
+        updated_event = state["service"].events().update(
+            calendarId=CALENDAR_ID,
+            eventId=state["event_id"],
+            body=event
+        ).execute()
+        
+        return state | {
+            "results": [updated_event],
+            "status": "updated"
+        }
+    except Exception as e:
+        return state | {"error": f"Erro ao atualizar evento: {str(e)}", "status": "error"}
+
+# Function to format events google calendar
+def format_events(events):
+    """Função auxiliar para formatar eventos"""
+    formatted = []
+    for event in events:
+        summary = event.get('summary', 'Sem título')
+        start = event['start'].get('dateTime', event['start'].get('date'))
+        end = event['end'].get('dateTime', event['end'].get('date'))
+        status = event.get('status', 'N/A')
+        description = event.get('description', 'Sem descrição')
+        
+        if 'T' in start:  # eventos com hora
+            start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
+            end_dt = datetime.fromisoformat(end.replace('Z', '+00:00'))
+            event_str = [
+                f"📅 {summary}",
+                f"   Início: {start_dt.strftime('%d/%m/%Y %H:%M')}",
+                f"   Fim: {end_dt.strftime('%d/%m/%Y %H:%M')}",
+                f"   Status: {status}",
+                "   Descrição:"
+            ]
+        else:  # eventos de dia inteiro
+            start_dt = datetime.fromisoformat(start)
+            end_dt = datetime.fromisoformat(end)
+            event_str = [
+                f"📅 {summary}",
+                f"   Data: {start_dt.strftime('%d/%m/%Y')} (Dia inteiro)",
+                f"   Status: {status}",
+                "   Descrição:"
+            ]
+
+        description_lines = process_description(description)
+        for line in description_lines:
+            event_str.append(f"      - {line}")
+            
+        formatted.append("\n".join(event_str))
+        
+    return formatted
+
+# Function to check availability events google calendar
+def verify_availability(state: State) -> State:
+    """Verifica disponibilidade de horário e executa ação seguinte se necessário"""
+    if state["action"] != "verificar":
+        return state
+        
+    try:
+        params = state["parameters"]
+        start_datetime = f"{params['date']} {params['time']}"
+        start_date = datetime.strptime(start_datetime, "%d/%m/%Y %H:%M")
+        end_date = start_date.replace(hour=start_date.hour + 1)
+        
+        # Converter para RFC3339 timestamp com timezone
+        start = start_date.isoformat() + '-03:00'
+        end = end_date.isoformat() + '-03:00'
+
+        print(f"Buscando eventos entre {start} e {end}")
+
+        events_result = state["service"].events().list(
+            calendarId=CALENDAR_ID,
+            timeMin=start,
+            timeMax=end,
+            maxResults=1,
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+
+        events = events_result.get('items', [])
+        
+        next_action = params.get('next_action')
+        if next_action:
+            if events and next_action == 'deletar':
+                return state | {
+                    "next_action": "delete",
+                    "event_id": events[0]['id'],
+                    "status": "pending_delete"
+                }
+            elif not events and next_action == 'criar':
+                return state | {
+                    "next_action": "create",
+                    "status": "pending_create"
+                }
+            elif not events and next_action == 'atualizar':
+                return state | {
+                    "next_action": "update",
+                    "status": "pending_update"
+                }
+        
+        if events:
+            return state | {
+                "results": events,
+                "formatted_results": ["Este horário está ocupado com os seguintes eventos:\n" + "\n".join(format_events(events))],
+                "status": "verified_occupied"
+            }
+        else:
+            return state | {
+                "formatted_results": ["Este horário está livre para agendamentos."],
+                "status": "verified_free"
+            }
+            
+    except Exception as e:
+        print(f"Erro detalhado: {str(e)}")  # Debug
+        return state | {"error": f"Erro ao verificar disponibilidade: {str(e)}", "status": "error"}
+
+
+
+# Configure workflow
+workflow = StateGraph(State)
+
+# Add node
+workflow.add_node("setup", setup_calendar)
+workflow.add_node("interpret", interpret_query)
+workflow.add_node("verify", verify_availability)
+workflow.add_node("list", list_events)
+workflow.add_node("create", create_event)
+workflow.add_node("delete", delete_event)
+workflow.add_node("update", update_event)
+
+
+# Define start
+workflow.set_entry_point("setup")
+
+# Add simple edge to interpret
+workflow.add_edge("setup", "interpret")
+
+# Edges interpret node (removi a função check_action e simplifiquei as condições)
+workflow.add_conditional_edges(
+    "interpret",
+    {
+        "verify": lambda x: x["action"] == "verificar",
+        "list": lambda x: x["action"] == "listar",
+        "create": lambda x: x["action"] == "criar",
+        "delete": lambda x: x["action"] == "listar_para_deletar",
+        "update": lambda x: x["action"] == "listar_para_atualizar",
+        END: lambda x: x["action"] not in ["verificar", "listar", "criar", "listar_para_deletar", "listar_para_atualizar"]
+    }
+)
+
+# Edges verify node
+workflow.add_conditional_edges(
+    "verify",
+    {
+        "create": lambda x: x.get("next_action") == "create",
+        "delete": lambda x: x.get("next_action") == "delete",
+        "update": lambda x: x.get("next_action") == "update",
+        END: lambda x: True
+    }
+)
+
+# Edges to finish
+workflow.add_edge("list", END)
+workflow.add_edge("create", END)
+workflow.add_edge("delete", END)
+workflow.add_edge("update", END)
+
+# Compile workflow
+app = workflow.compile()
+
+# Generate diagram
+workflow_image = app.get_graph().draw_mermaid_png(
+    draw_method=MermaidDrawMethod.API,
+)
+with open("workflow.png", "wb") as f:
+    f.write(workflow_image)
+
+# Function main
+if __name__ == "__main__":
+    try:
+        while True:
+            query = input("Como posso ajudar? ")
+            if query.lower() in ['sair', 'exit', 'quit']:
+                break
+                
+            initial_state = State(
+                query=query,
+                service=None,  # Será configurado pelo setup_calendar
+                action="",
+                parameters={},
+                events=[],
+                formatted_events=[],
+                event_id="",
+                status="started",
+                error="",
+                next_action="",
+                confirmation=False,
+                start_date="",
+                end_date="",
+                event_data={}
+            )
+            
+            try:
+                result = app.invoke(initial_state)
+                
+                if result.get("error"):
+                    print(f"❌ {result['error']}")
+                elif result.get("formatted_results"):
+                    if isinstance(result["formatted_results"], list):
+                        print("\n\n".join(result["formatted_results"]))
+                    else:
+                        print(result["formatted_results"])
+                else:
+                    print(result.get("status", "Operação concluída"))
+                    
+            except Exception as e:
+                print(f"❌ Erro na execução do workflow: {str(e)}")
+                
+    except Exception as e:
+        print(f"❌ Erro inesperado: {str(e)}")
